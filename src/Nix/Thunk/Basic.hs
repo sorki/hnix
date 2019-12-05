@@ -77,7 +77,8 @@ forceThunk (Thunk n active ref) k = do
       if nowActive
         then throwM $ ThunkLoop $ show n
         else do
-          traceM $ "Forcing " ++ show n
+          -- Way too verbose. We force all the time
+          -- traceM $ "Forcing " ++ show n
           v <- catch action $ \(e :: SomeException) -> do
             _ <- atomicModifyVar active (False, )
             throwM e
