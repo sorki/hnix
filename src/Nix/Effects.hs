@@ -10,6 +10,8 @@
 
 module Nix.Effects where
 
+import           Debug.Trace                    ( traceShowId )
+
 import           Prelude                 hiding ( putStr
                                                 , putStrLn
                                                 , print
@@ -127,7 +129,7 @@ instance MonadInstantiate IO where
                                                     ["--eval", "--expr", expr]
                                                     ""
     case exitCode of
-      ExitSuccess -> case parseNixTextLoc (T.pack out) of
+      ExitSuccess -> case parseNixTextLoc (T.pack $ traceShowId out) of
         Failure e ->
           return
             $  Left

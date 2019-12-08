@@ -7,6 +7,9 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -14,14 +17,19 @@
 
 module Nix.Effects.Basic where
 
+import           Control.Monad.Writer
+import           Control.Arrow
+
 import           Control.Monad
 import           Control.Monad.State.Strict
+import           Data.Char                      ( isAscii, isAlphaNum )
+import           Data.Foldable                  ( foldrM )
 import           Data.HashMap.Lazy              ( HashMap )
 import qualified Data.HashMap.Lazy             as M
 import           Data.List
 import           Data.List.Split
 import           Data.Maybe                     ( maybeToList )
-import qualified Data.Set                      as S
+import qualified Data.HashSet                  as S
 import           Data.Text                      ( Text )
 import qualified Data.Text                     as Text
 import           Data.Text.Prettyprint.Doc
@@ -32,9 +40,11 @@ import           Nix.Exec                       ( MonadNix
                                                 , callFunc
                                                 , evalExprLoc
                                                 , nixInstantiateExpr
+                                                , fromStringNoContext
                                                 )
 import           Nix.Expr
 import           Nix.Frames
+import           Nix.Json                       ( nvalueToJSONNixString )
 import           Nix.Normal
 import           Nix.Parser
 import           Nix.Pretty
@@ -298,305 +308,309 @@ defaultDerivationStrict = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
       ys <- traverse (`demand` coerceNix) xs
       toValue @[NValue t f m] ys
 
+data HashType = SHA256 | MD5 | SHA1
+
 data Derivation = Derivation
   { outputs :: [ Text ]
-  , inputSrcs :: S.Set (StorePath storeDir)
-  , inputDrvs :: S.Set (StorePath storeDir)
+  , inputs :: S.HashSet StringContext
   , platform :: Text
-  , builder :: (StorePath storeDir)
+  , builder :: Text -- should be typed as a store path
   , args :: [ Text ]
-  , env :: Either (M.HashMap Text Text) (JSONObject)
+  , env :: M.HashMap Text Text
+  , fixed :: Maybe (Text, HashType)
+  , hashMode :: HashMode
+  , useJson :: Bool
   }
 
-
--- static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * args, Value & v)
-defaultDerivationStrict' :: forall e t f m . MonadNix e t f m => NValue t f m -> m (NValue t f m)
-defaultDerivationStrict' 
--- {
---     state.forceAttrs(*args[0], pos);
-  = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
--- 
---     /* Figure out the name first (for stack backtraces). */
---     Bindings::iterator attr = args[0]->attrs->find(state.sName);
---     if (attr == args[0]->attrs->end())
---         throw EvalError(format("required attribute 'name' missing, at %1%") % pos);
---
---     string drvName;
---     Pos & posDrvName(*attr->pos);
---     try {
---         drvName = state.forceStringNoCtx(*attr->value, pos);
---     } catch (Error & e) {
---         e.addPrefix(format("while evaluating the derivation attribute 'name' at %1%:\n") % posDrvName);
---         throw;
---     }
--- 
-    drvName <- demandAttr "name" s
-
---     /* Check whether attributes should be passed as a JSON file. */
---     std::ostringstream jsonBuf;
---     std::unique_ptr<JSONObject> jsonObject;
---     attr = args[0]->attrs->find(state.sStructuredAttrs);
---     if (attr != args[0]->attrs->end() && state.forceBool(*attr->value, pos))
---         jsonObject = std::make_unique<JSONObject>(jsonBuf);
-    structuredAttrs <- maybeForceAttr False "__structuredAttrs" s
-
--- 
---     /* Check whether null attributes should be ignored. */
---     bool ignoreNulls = false;
---     attr = args[0]->attrs->find(state.sIgnoreNulls);
---     if (attr != args[0]->attrs->end())
---         ignoreNulls = state.forceBool(*attr->value, pos);
-    ignoreNulls <- maybeForceAttr False "__ignoreNulls" s
+data HashMode = Flat | Recursive
 
 
---                     if (i->name == state.sBuilder) drv.builder = s;
---                     else if (i->name == state.sSystem) drv.platform = s;
---                     else if (i->name == state.sOutputHash) outputHash = s;
---                     else if (i->name == state.sOutputHashAlgo) outputHashAlgo = s;
---                     else if (i->name == state.sOutputHashMode) handleHashMode(s);
---                     else if (i->name == state.sOutputs)
+defaultDerivationStrict' :: forall e t f m . MonadNix e t f m => NValue t f m -> m Derivation -- m (NValue t f m)
+defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
+    (drv, ctx) <- runWithStringContextT' $ buildDerivationWithContext s
+    return drv { inputs = ctx }
+  where
+    -- | Build a derivation in a context collecting dependencies.
+    -- This is complex from a typing standpoint, but it allows to perform the
+    -- full computation without worrying too much about all the string's contexts.
+    buildDerivationWithContext :: (MonadNix e t f m) => AttrSet (NValue t f m) -> WithStringContextT m Derivation
+    buildDerivationWithContext s = do
+        -- Parse name first, so we can add an informative frame
+        drvName     <- getAttr      "name"              $ extractNixString >=> assertDrvStoreName
+        withFrame' Info (ErrorCall $ "While evaluating derivation " ++ show drvName) $ do
 
-    builder <- demandAttr "builder" s
-    platform <- demandAttr "system" s
-    outputHash <- {- ensureValid <$> -} demandMaybeAttr "outputHash" s
-    outputHashAlgo <- {- ensureValid <$> -} demandMaybeAttr "outputHashAlgo" s
-    outputHashRecursive <- {- handleHashMode <$> -} maybeForceAttr "flat" "outputHashMode" s
-    outputs <- {- handleoutputs <$> -} maybeForceAttr [ "out" ] "outputs" s
+          useJson     <- getAttrOr    "__structuredAttrs" (return False)   $ return
+          ignoreNulls <- getAttrOr    "__ignoreNulls"     (return False)   $ return
 
--- 
---     /* Build the derivation expression by processing the attributes. */
---     Derivation drv;
--- 
---     PathSet context;
---     TODO: Handle context
--- 
---     std::optional<std::string> outputHash;
---     std::string outputHashAlgo;
---     bool outputHashRecursive = false;
--- 
---     StringSet outputs;
---     outputs.insert("out");
--- 
---     for (auto & i : args[0]->attrs->lexicographicOrder()) {
---         if (i->name == state.sIgnoreNulls) continue;
---         const string & key = i->name;
---         vomit("processing attribute '%1%'", key);
---         auto handleHashMode = [&](const std::string & s) {
---             if (s == "recursive") outputHashRecursive = true;
---             else if (s == "flat") outputHashRecursive = false;
---             else throw EvalError("invalid value '%s' for 'outputHashMode' attribute, at %s", s, posDrvName);
---         };
--- 
---         auto handleOutputs = [&](const Strings & ss) {
---             outputs.clear();
---             for (auto & j : ss) {
---                 if (outputs.find(j) != outputs.end())
---                     throw EvalError(format("duplicate derivation output '%1%', at %2%") % j % posDrvName);
---                 /* !!! Check whether j is a valid attribute
---                    name. */
---                 /* Derivations cannot be named ‘drv’, because
---                    then we'd have an attribute ‘drvPath’ in
---                    the resulting set. */
---                 if (j == "drv")
---                     throw EvalError(format("invalid derivation output name 'drv', at %1%") % posDrvName);
---                 outputs.insert(j);
---             }
---             if (outputs.empty())
---                 throw EvalError(format("derivation cannot have an empty set of outputs, at %1%") % posDrvName);
---         };
--- 
---         try {
---         
---             if (ignoreNulls) {
---                 state.forceValue(*i->value);
---                 if (i->value->type == tNull) continue;
---             }
---
---             /* The `args' attribute is special: it supplies the
---                command-line arguments to the builder. */
---             if (i->name == state.sArgs) {
---                 state.forceList(*i->value, pos);
---                 for (unsigned int n = 0; n < i->value->listSize(); ++n) {
---                     string s = state.coerceToString(posDrvName, *i->value->listElems()[n], context, true);
---                     drv.args.push_back(s);
---                 }
---             }
---             
---             /* All other attributes are passed to the builder through
---                the environment. */
---             else {
--- 
---                 if (jsonObject) {
--- 
---                     if (i->name == state.sStructuredAttrs) continue;
--- 
---                     auto placeholder(jsonObject->placeholder(key));
---                     printValueAsJSON(state, true, *i->value, placeholder, context);
--- 
---                     if (i->name == state.sBuilder)
---                         drv.builder = state.forceString(*i->value, context, posDrvName);
---                     else if (i->name == state.sSystem)
---                         drv.platform = state.forceStringNoCtx(*i->value, posDrvName);
---                     else if (i->name == state.sOutputHash)
---                         outputHash = state.forceStringNoCtx(*i->value, posDrvName);
---                     else if (i->name == state.sOutputHashAlgo)
---                         outputHashAlgo = state.forceStringNoCtx(*i->value, posDrvName);
---                     else if (i->name == state.sOutputHashMode)
---                         handleHashMode(state.forceStringNoCtx(*i->value, posDrvName));
---                     else if (i->name == state.sOutputs) {
---                         /* Require ‘outputs’ to be a list of strings. */
---                         state.forceList(*i->value, posDrvName);
---                         Strings ss;
---                         for (unsigned int n = 0; n < i->value->listSize(); ++n)
---                             ss.emplace_back(state.forceStringNoCtx(*i->value->listElems()[n], posDrvName));
---                         handleOutputs(ss);
---                     }
--- 
---                 } else {
---                     auto s = state.coerceToString(posDrvName, *i->value, context, true);
---                     drv.env.emplace(key, s);
---                     if (i->name == state.sBuilder) drv.builder = s;
---                     else if (i->name == state.sSystem) drv.platform = s;
---                     else if (i->name == state.sOutputHash) outputHash = s;
---                     else if (i->name == state.sOutputHashAlgo) outputHashAlgo = s;
---                     else if (i->name == state.sOutputHashMode) handleHashMode(s);
---                     else if (i->name == state.sOutputs)
---                         handleOutputs(tokenizeString<Strings>(s));
---                 }
--- 
---             }
--- 
---         } catch (Error & e) {
---             e.addPrefix(format("while evaluating the attribute '%1%' of the derivation '%2%' at %3%:\n")
---                 % key % drvName % posDrvName);
---             throw;
---         }
---     }
--- 
---     if (jsonObject) {
---         jsonObject.reset();
---         drv.env.emplace("__json", jsonBuf.str());
---     }
--- 
---     /* Everything in the context of the strings in the derivation
---        attributes should be added as dependencies of the resulting
---        derivation. */
---     for (auto & path : context) {
--- 
---         /* Paths marked with `=' denote that the path of a derivation
---            is explicitly passed to the builder.  Since that allows the
---            builder to gain access to every path in the dependency
---            graph of the derivation (including all outputs), all paths
---            in the graph must be added to this derivation's list of
---            inputs to ensure that they are available when the builder
---            runs. */
---         if (path.at(0) == '=') {
---             /* !!! This doesn't work if readOnlyMode is set. */
---             PathSet refs;
---             state.store->computeFSClosure(string(path, 1), refs);
---             for (auto & j : refs) {
---                 drv.inputSrcs.insert(j);
---                 if (isDerivation(j))
---                     drv.inputDrvs[j] = state.store->queryDerivationOutputNames(j);
---             }
---         }
--- 
---         /* Handle derivation outputs of the form ‘!<name>!<path>’. */
---         else if (path.at(0) == '!') {
---             std::pair<string, string> ctx = decodeContext(path);
---             drv.inputDrvs[ctx.first].insert(ctx.second);
---         }
--- 
---         /* Otherwise it's a source file. */
---         else
---             drv.inputSrcs.insert(path);
---     }
--- 
---     /* Do we have all required attributes? */
---     if (drv.builder == "")
---         throw EvalError(format("required attribute 'builder' missing, at %1%") % posDrvName);
---     if (drv.platform == "")
---         throw EvalError(format("required attribute 'system' missing, at %1%") % posDrvName);
--- 
---     /* Check whether the derivation name is valid. */
---     checkStoreName(drvName);
---     if (isDerivation(drvName))
---         throw EvalError(format("derivation names are not allowed to end in '%1%', at %2%")
---             % drvExtension % posDrvName);
-    (env, inputSrcs, inputDrvs) <- if structuredAttrs
-      then Right <$> toJson $ deleteAll [ "__ignoreNulls" "__structuredAttrs" ] s
-      else Left <$> forceToString $ deleteAll [ "__ignoreNulls" ] s
+          args        <- getAttr      "args"              $ mapM (fromValue' >=> extractNixString)
+          builder     <- getAttr      "builder"           $ extractNixString
+          platform    <- getAttr      "system"            $ extractNoCtx >=> assertNonNull
+          hash        <- getAttrMaybe "outputHash"        $ extractNoCtx
+          hashAlgo    <- getAttrMaybe "outputHashAlgo"    $ extractNoCtx
+          hashMode    <- getAttrOr    "outputHashMode"    (return Flat)    $ extractNoCtx >=> parseHashMode
+          outputs     <- getAttrOr    "outputs"           (return ["out"]) $ mapM (fromValue' >=> extractNoCtx)
 
--- 
---     if (outputHash) {
---         /* Handle fixed-output derivations. */
---         if (outputs.size() != 1 || *(outputs.begin()) != "out")
---             throw Error(format("multiple outputs are not supported in fixed-output derivations, at %1%") % posDrvName);
--- 
---         HashType ht = outputHashAlgo.empty() ? htUnknown : parseHashType(outputHashAlgo);
---         Hash h(*outputHash, ht);
--- 
---         Path outPath = state.store->makeFixedOutputPath(outputHashRecursive, h, drvName);
---         if (!jsonObject) drv.env["out"] = outPath;
---         drv.outputs["out"] = DerivationOutput(outPath,
---             (outputHashRecursive ? "r:" : "") + printHashType(h.type),
---             h.to_string(Base16, false));
---     }
--- 
---     else {
---         /* Construct the "masked" store derivation, which is the final
---            one except that in the list of outputs, the output paths
---            are empty, and the corresponding environment variables have
---            an empty value.  This ensures that changes in the set of
---            output names do get reflected in the hash. */
---         for (auto & i : outputs) {
---             if (!jsonObject) drv.env[i] = "";
---             drv.outputs[i] = DerivationOutput("", "", "");
---         }
--- 
---         /* Use the masked derivation expression to compute the output
---            path. */
---         Hash h = hashDerivationModulo(*state.store, drv);
--- 
---         for (auto & i : drv.outputs)
---             if (i.second.path == "") {
---                 Path outPath = state.store->makeOutputPath(i.first, h, drvName);
---                 if (!jsonObject) drv.env[i.first] = outPath;
---                 i.second.path = outPath;
---             }
---     }
--- 
---     /* Write the resulting term into the Nix store directory. */
---     Path drvPath = writeDerivation(state.store, drv, drvName, state.repair);
--- 
---     printMsg(lvlChatty, format("instantiated '%1%' -> '%2%'")
---         % drvName % drvPath);
-    path <- {- writeDerivation $ -} case outputHash of
-      Nothing -> error "not implemented" -- Derivation outputs inputSrcs inputDrvs platform builder args env
-      Just hash -> error "not implemented" -- fixedOutputDerivation
+          -- filter out null values if needed.
+          attrs :: AttrSet (NValue t f m) <- if not ignoreNulls
+            then return s
+            else M.mapMaybe id <$> (forM s $ demand' ?? (\case
+                   NVConstant NNull -> return Nothing
+                   value -> return $ Just value
+                   ))
 
---     /* Optimisation, but required in read-only mode! because in that
---        case we don't actually write store derivations, so we can't
---        read them later. */
---     drvHashes[drvPath] = hashDerivationModulo(*state.store, drv);
-    -- XXX We have a readonly store for this !
+          env <- if useJson
+            then do
+              jsonString :: NixString <- lift $ nvalueToJSONNixString $ flip nvSet M.empty $ 
+                deleteAll [ "args", "__ignoreNulls", "__structuredAttrs" ] attrs
+              string :: Text <- extractNixString jsonString
+              return $ M.singleton "__json" string
+            else
+              mapM (lift . coerceToString callFunc CopyToStore CoerceAny >=> extractNixString) $
+                deleteAll [ "args", "__ignoreNulls" ] attrs
 
+          fixedOutput <- case hash of
+            Nothing -> return Nothing
+            Just hash -> do
+              when (outputs /= ["out"]) $ lift $ throwError $ ErrorCall $ "Multiple outputs are not supported for fixed-output derivations"
+              hashType <- parseHashType hash
+              return $ Just (hash, hashType)
+
+          return $ Derivation outputs S.empty platform builder args env fixedOutput hashMode useJson
+      where 
+        -- common functions, lifted to WithStringContextT
+
+        demand' :: NValue t f m -> (NValue t f m -> WithStringContextT m a) -> WithStringContextT m a
+        demand' v f = join $ lift $ demand v (return . f)
+
+        fromValue' :: (FromValue a m (NValue t f m), MonadNix e t f m) => NValue t f m -> WithStringContextT m a
+        fromValue' = lift . fromValue
+
+        withFrame' :: forall s e m a . (Framed e m, Exception s) => NixLevel -> s -> WithStringContextT m a -> WithStringContextT m a
+        withFrame' level f = join . lift . withFrame level f . return
+
+        -- shortcuts to `demand` an attrset field
+
+        getAttr :: (MonadNix e t f m, FromValue v m (NValue t f m))
+          => Text -> (v -> WithStringContextT m a) -> WithStringContextT m a
+        getAttr n = getAttrOr n (lift $ throwError $ ErrorCall $ "Required attribute '" ++ show n ++ "' not found.")
+
+        getAttrOr :: (MonadNix e t f m, FromValue v m (NValue t f m))
+          => Text -> WithStringContextT m a -> (v -> WithStringContextT m a) -> WithStringContextT m a
+        getAttrOr n d f = flip (maybe d) (M.lookup n s) $ \v ->  
+          withFrame' Info (ErrorCall $ "While evaluating attribute '" ++ show n ++ "'") $ fromValue' v >>= f
+
+        getAttrMaybe :: (MonadNix e t f m, FromValue v m (NValue t f m))
+          => Text -> (v -> WithStringContextT m a) -> WithStringContextT m (Maybe a)
+        getAttrMaybe n f = getAttrOr n (return Nothing) (fmap Just . f)
+
+        -- Test validity for fields
+
+        assertDrvStoreName :: MonadNix e t f m => Text -> WithStringContextT m Text
+        assertDrvStoreName name = lift $ do
+          let invalid c = not $ isAscii c && (isAlphaNum c || c `elem` ("+-._?=" :: String)) -- isAlphaNum allows non-ascii chars.
+          let fail reason = throwError $ ErrorCall $ "Store name " ++ show name ++ " " ++ reason
+          when ("." `Text.isPrefixOf` name)    $ fail "cannot start with a period"
+          when (Text.length name > 211)        $ fail "must be no longer than 211 characters"
+          when (Text.any invalid name)         $ fail "contains some invalid character"
+          when (".drv" `Text.isSuffixOf` name) $ fail "is not allowed to end in '.drv'"
+          return name
+
+        extractNoCtx :: MonadNix e t f m => NixString -> WithStringContextT m Text
+        extractNoCtx ns = case principledGetStringNoContext ns of
+          Nothing -> lift $ throwError $ ErrorCall $ "The string " ++ show ns ++ " is not allowed to have a context."
+          Just v -> return v
+
+        assertNonNull :: MonadNix e t f m => Text -> WithStringContextT m Text
+        assertNonNull t = do
+          when (Text.null t) $ lift $ throwError $ ErrorCall "Value must not be empty"
+          return t
+
+        parseHashMode :: MonadNix e t f m => Text -> WithStringContextT m HashMode
+        parseHashMode = \case 
+          "flat" ->      return Flat
+          "recursive" -> return Recursive
+          other -> lift $ throwError $ ErrorCall $ "Hash mode " ++ show other ++ " is not valid. It must be either 'flat' or 'recursive'"
+
+        parseHashType :: Text -> WithStringContextT m HashType
+        parseHashType = \case
+          "sha1"   -> return SHA1
+          "sha256" -> return SHA256
+          "md5"    -> return MD5
+          other -> lift $ throwError $ ErrorCall $ "Hash type " ++ show other ++ " is not a valid hash type"
+
+        -- Other helpers
+
+        deleteAll :: [Text] -> AttrSet a -> AttrSet a
+        deleteAll keys s = foldl' (flip M.delete) s keys
+            
+-- --     if (jsonObject) {
+-- --         jsonObject.reset();
+-- --         drv.env.emplace("__json", jsonBuf.str());
+-- --     }
+-- -- 
+-- --     /* Everything in the context of the strings in the derivation
+-- --        attributes should be added as dependencies of the resulting
+-- --        derivation. */
+-- --     for (auto & path : context) {
+-- -- 
+-- --         /* Paths marked with `=' denote that the path of a derivation
+-- --            is explicitly passed to the builder.  Since that allows the
+-- --            builder to gain access to every path in the dependency
+-- --            graph of the derivation (including all outputs), all paths
+-- --            in the graph must be added to this derivation's list of
+-- --            inputs to ensure that they are available when the builder
+-- --            runs. */
+-- --         if (path.at(0) == '=') {
+-- --             /* !!! This doesn't work if readOnlyMode is set. */
+-- --             PathSet refs;
+-- --             state.store->computeFSClosure(string(path, 1), refs);
+-- --             for (auto & j : refs) {
+-- --                 drv.inputSrcs.insert(j);
+-- --                 if (isDerivation(j))
+-- --                     drv.inputDrvs[j] = state.store->queryDerivationOutputNames(j);
+-- --             }
+-- --         }
+-- -- 
+-- --         /* Handle derivation outputs of the form ‘!<name>!<path>’. */
+-- --         else if (path.at(0) == '!') {
+-- --             std::pair<string, string> ctx = decodeContext(path);
+-- --             drv.inputDrvs[ctx.first].insert(ctx.second);
+-- --         }
+-- -- 
+-- --         /* Otherwise it's a source file. */
+-- --         else
+-- --             drv.inputSrcs.insert(path);
+-- --     }
+-- -- 
 -- 
---     state.mkAttrs(v, 1 + drv.outputs.size());
---     mkString(*state.allocAttr(v, state.sDrvPath), drvPath, {"=" + drvPath});
---     for (auto & i : drv.outputs) {
---         mkString(*state.allocAttr(v, state.symbols.create(i.first)),
---             i.second.path, {"!" + i.first + "!" + drvPath});
---     }
---     v.attrs->sort();
--- }
-    let resultAttrs = [ ("drvPath", Direct path) ] ++ map (\o -> (o, Indirect o path))
-    return $ nvSet (M.fromList resultAttrs) M.null
- where
-  demandAttr n s = maybeForceAttr (error "Required attribute '" ++ n ++ "' not found.") n s
-  maybeForceAttr d n s = maybe (pure d) (demand ?? fromValue) (M.lookup n s)
-  demandMaybeAttr n s = (demand ?? fromValue) <$> (M.lookup n s)
-  deleteAll keys s = foldl' (flip M.delete) s keys
+--     -- TODO: handle ignoreNulls
+--     (env, context) <- if structuredAttrs
+--       then do
+--         jsonString <- nvalueToJSONNixString $ deleteAll [ "args" "__ignoreNulls" "__structuredAttrs" ] s
+--         let (string, context) = (principledStringIgnoreContext jsonString, principledGetContext jsonString)
+--         return (nvSet (S.singleton "__json" string) S.empty, context)
+--       else pure (nvSet S.empty S.empty, S.empty) -- TODO
+-- 
+-- -- 
+-- --     if (outputHash) {
+-- --         /* Handle fixed-output derivations. */
+-- --         if (outputs.size() != 1 || *(outputs.begin()) != "out")
+-- --             throw Error(format("multiple outputs are not supported in fixed-output derivations, at %1%") % posDrvName);
+-- -- 
+-- --         HashType ht = outputHashAlgo.empty() ? htUnknown : parseHashType(outputHashAlgo);
+-- --         Hash h(*outputHash, ht);
+-- -- 
+-- --         Path outPath = state.store->makeFixedOutputPath(outputHashRecursive, h, drvName);
+-- --         if (!jsonObject) drv.env["out"] = outPath;
+-- --         drv.outputs["out"] = DerivationOutput(outPath,
+-- --             (outputHashRecursive ? "r:" : "") + printHashType(h.type),
+-- --             h.to_string(Base16, false));
+-- --     }
+-- -- 
+-- --     else {
+-- --         /* Construct the "masked" store derivation, which is the final
+-- --            one except that in the list of outputs, the output paths
+-- --            are empty, and the corresponding environment variables have
+-- --            an empty value.  This ensures that changes in the set of
+-- --            output names do get reflected in the hash. */
+-- --         for (auto & i : outputs) {
+-- --             if (!jsonObject) drv.env[i] = "";
+-- --             drv.outputs[i] = DerivationOutput("", "", "");
+-- --         }
+-- -- 
+-- --         /* Use the masked derivation expression to compute the output
+-- --            path. */
+-- --         Hash h = hashDerivationModulo(*state.store, drv);
+-- -- 
+-- --         for (auto & i : drv.outputs)
+-- --             if (i.second.path == "") {
+-- --                 Path outPath = state.store->makeOutputPath(i.first, h, drvName);
+-- --                 if (!jsonObject) drv.env[i.first] = outPath;
+-- --                 i.second.path = outPath;
+-- --             }
+-- --     }
+-- -- 
+-- --     /* Write the resulting term into the Nix store directory. */
+-- --     Path drvPath = writeDerivation(state.store, drv, drvName, state.repair);
+-- -- 
+-- --     printMsg(lvlChatty, format("instantiated '%1%' -> '%2%'")
+-- --         % drvName % drvPath);
+--     path <- {- writeDerivation $ -} case outputHash of
+--       Nothing -> error "not implemented" -- Derivation outputs inputSrcs inputDrvs platform builder args env
+--       Just hash -> error "not implemented" -- fixedOutputDerivation
+-- 
+--     let resultAttrs = [ ("drvPath", Direct path) ] ++ map (\o -> (o, Indirect o path))
+--     return $ nvSet (M.fromList resultAttrs) M.null
+--  where
+-- --         auto parseHashMode = [&](const std::string & s) {
+-- --             if (s == "recursive") outputHashRecursive = true;
+-- --             else if (s == "flat") outputHashRecursive = false;
+-- --             else throw EvalError("invalid value '%s' for 'outputHashMode' attribute, at %s", s, posDrvName);
+-- --         };
+-- 
+-- 
+-- --         auto handleOutputs = [&](const Strings & ss) {
+-- --             outputs.clear();
+-- --             for (auto & j : ss) {
+-- --                 if (outputs.find(j) != outputs.end())
+-- --                     throw EvalError(format("duplicate derivation output '%1%', at %2%") % j % posDrvName);
+-- --                 /* !!! Check whether j is a valid attribute
+-- --                    name. */
+-- --                 /* Derivations cannot be named ‘drv’, because
+-- --                    then we'd have an attribute ‘drvPath’ in
+-- --                    the resulting set. */
+-- --                 if (j == "drv")
+-- --                     throw EvalError(format("invalid derivation output name 'drv', at %1%") % posDrvName);
+-- --                 outputs.insert(j);
+-- --             }
+-- --             if (outputs.empty())
+-- --                 throw EvalError(format("derivation cannot have an empty set of outputs, at %1%") % posDrvName);
+-- --         };
+--   getAttr :: forall a e t f m . MonadNix e t f m
+--     => Text -> AttrSet (NValue t f m) -> (NValue t f m -> m a) -> m a
+--   getAttr n s f = case (M.lookup n s) of
+--     Nothing -> throwError $ ErrorCall $ "Required attribute '" ++ n ++ "' not found."
+--     Just v -> do
+--       withFrame Info ("While evaluating attribute '" ++ name ++ "'") $ do
+--         demand v f
+-- 
+--   getAttrDeeper :: forall a e t f m . MonadNix e t f m
+--     => Text -> AttrSet (NValue t f m) -> (NValue t f m -> m a) -> m a
+--   getAttrDeeper n s f = case (M.lookup n s) of
+--     Nothing -> throwError $ ErrorCall $ "Required attribute '" ++ n ++ "' not found."
+--     Just v -> do
+--       withFrame Info ("While evaluating attribute '" ++ name ++ "'") $ do
+--         demand (Deeper v) f
+-- 
+--   getAttrOr d n s = case (M.lookup n s) of
+--     Nothing -> pure d
+--     Just v -> do
+--       withFrame Info ("While evaluating attribute '" ++ name ++ "'") $ do
+--         demand v fromValue
+-- 
+--   demandMaybeAttr n s = (demand ?? fromValue) <$> (M.lookup n s)
+--   assertNonNull value = do
+--     when (null value) $ throwError $ ErrorCall "Expected a non-empty value"
+--     return value
+--   assertDrvStoreName
+--     :: forall e t f m . MonadNix e t f m
+--     => Text -> m Text
+--   assertDrvStoreName name = do
+--     let invalid c = not $ isAscii c && (isAphaNum c || c `elem` "+-._?=") -- isAlphNum allows non-ascii chars.
+--     when ("." `isPrefixOf` name)    $ throwError $ ErrorCall "store names cannot start with a period"
+--     when (length name > 211)        $ throwError $ ErrorCall "store names must be no longer than 211 characters"
+--     when (any invalid name)         $ throwError $ ErrorCall "store name '" ++ name ++ "' contains some invalid character"
+--     when (".drv" `isSuffixOf` name) $ throwError $ ErrorCall "Derivation names are not allowed to end in '.drv'"
+--     return name
+--   
+--   coerceNix :: NValue t f m -> m (NValue t f m)
+--   coerceNix = toValue <=< coerceToString callFunc CopyToStore CoerceAny
+-- 
+--   coerceNixList :: NValue t f m -> m (NValue t f m)
+--   coerceNixList v = do
+--     xs <- fromValue @[NValue t f m] v
+--     ys <- traverse (`demand` coerceNix) xs
+--     toValue @[NValue t f m] ys
 
 defaultTraceEffect :: MonadPutStr m => String -> m ()
 defaultTraceEffect = Nix.Effects.putStrLn

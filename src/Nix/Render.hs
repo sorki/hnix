@@ -74,6 +74,9 @@ posAndMsg (SourcePos _ lineNo _) msg = FancyError
 
 renderLocation :: MonadFile m => SrcSpan -> Doc a -> m (Doc a)
 renderLocation (SrcSpan (SourcePos file begLine begCol) (SourcePos file' endLine endCol)) msg
+  | file == file' && file == "<string>" && begLine == endLine
+  = pure $ "In raw input string at position " <> pretty (unPos begCol)
+
   | file /= "<string>" && file == file'
   = do
     exist <- doesFileExist file
@@ -88,14 +91,6 @@ renderLocation (SrcSpan (SourcePos file begLine begCol) (SourcePos file' endLine
               , txt
               ]
       else return msg
-renderLocation (SrcSpan (SourcePos file begLine begCol) (SourcePos file' endLine endCol)) msg
-  | file == file' && file == "<string>" && begLine == endLine
-  = do return $ vsep
-   [ "In raw input string at position "
-   <> pretty (unPos begCol)
-   <> ":"
-   , txt
-   ]
 renderLocation (SrcSpan beg end) msg =
   fail
     $  "Don't know how to render range from "

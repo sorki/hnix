@@ -37,7 +37,8 @@ import           Lens.Family2.Stock             ( _1
                                                 )
 import           Lens.Family2.TH
 
-#if ENABLE_TRACING
+#if 1
+-- ENABLE_TRACING
 import           Debug.Trace as X
 #else
 import           Prelude                       as X
