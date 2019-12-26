@@ -10,6 +10,7 @@
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ConstraintKinds #-}
 
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -311,13 +312,15 @@ defaultDerivationStrict = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
 data HashType = SHA256 | MD5 | SHA1
 
 data Derivation = Derivation
-  { outputs :: [ Text ]
+  { name :: Text
+  , outputNames :: [ Text ]
+  , outputs :: M.HashMap Text Text
   , inputs :: S.HashSet StringContext
   , platform :: Text
   , builder :: Text -- should be typed as a store path
   , args :: [ Text ]
   , env :: M.HashMap Text Text
-  , fixed :: Maybe (Text, HashType)
+  , mFixed :: Maybe (Text, HashType)
   , hashMode :: HashMode
   , useJson :: Bool
   }
@@ -327,9 +330,30 @@ data HashMode = Flat | Recursive
 
 defaultDerivationStrict' :: forall e t f m . MonadNix e t f m => NValue t f m -> m Derivation -- m (NValue t f m)
 defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
-    (drv, ctx) <- runWithStringContextT' $ buildDerivationWithContext s
-    return drv { inputs = ctx }
+    (drv@Derivation {..}, ctx) <- runWithStringContextT' $ buildDerivationWithContext s
+    drv' <- case mFixed of
+      Just (hash, hashType) -> do
+        outPath <- makeFixedOutputPath (hashMode == Recursive) (Digest @hashType hash) name (toStorePaths ctx)
+        let env' = M.insert "out" outPath env
+        return $ drv { env = env', outputs = M.singleton "out" outPath }
+      Nothing -> do
+        hash <- hashDerivationModulo (drv 
+                    { inputs = ctx
+                    , env = if useJson then env else foldl' (flip M.insert "") outputNames env
+                    })
+        return $ drv 
+            { env = if useJson then env else M.insertFromList (map (\o -> makeOutputPath o hash name) outputs) env
+            , inputs = ctx
+            , outputs = M.fromList $ map (\o -> makeOutputPath o hash name) outputs
+            }
+
+    drvPath <- writeDerivation drv
+
+    return $ flip nvSet M.empty $ M.insert "drvPath" drvPath (outputs drv')
+        
   where
+    
+
     -- | Build a derivation in a context collecting dependencies.
     -- This is complex from a typing standpoint, but it allows to perform the
     -- full computation without worrying too much about all the string's contexts.
@@ -345,18 +369,24 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
           args        <- getAttr      "args"              $ mapM (fromValue' >=> extractNixString)
           builder     <- getAttr      "builder"           $ extractNixString
           platform    <- getAttr      "system"            $ extractNoCtx >=> assertNonNull
-          hash        <- getAttrMaybe "outputHash"        $ extractNoCtx
-          hashAlgo    <- getAttrMaybe "outputHashAlgo"    $ extractNoCtx
+          mHash       <- getAttrOr    "outputHash"        (return Nothing) $ extractNoCtx >=> (return . Just)
           hashMode    <- getAttrOr    "outputHashMode"    (return Flat)    $ extractNoCtx >=> parseHashMode
           outputs     <- getAttrOr    "outputs"           (return ["out"]) $ mapM (fromValue' >=> extractNoCtx)
 
+          mFixedOutput <- case mHash of
+            Nothing -> return Nothing
+            Just hash -> do
+              when (outputs /= ["out"]) $ lift $ throwError $ ErrorCall $ "Multiple outputs are not supported for fixed-output derivations"
+              hashType <- getAttr "outputHashAlgo" $ extractNoCtx >=> parseHashType
+              return $ Just (hash, hashType)
+
           -- filter out null values if needed.
-          attrs :: AttrSet (NValue t f m) <- if not ignoreNulls
+          attrs <- if not ignoreNulls
             then return s
-            else M.mapMaybe id <$> (forM s $ demand' ?? (\case
-                   NVConstant NNull -> return Nothing
-                   value -> return $ Just value
-                   ))
+            else M.mapMaybe id <$> forM s (demand' ?? (\case
+                NVConstant NNull -> return Nothing
+                value -> return $ Just value
+              ))
 
           env <- if useJson
             then do
@@ -368,40 +398,28 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
               mapM (lift . coerceToString callFunc CopyToStore CoerceAny >=> extractNixString) $
                 deleteAll [ "args", "__ignoreNulls" ] attrs
 
-          fixedOutput <- case hash of
-            Nothing -> return Nothing
-            Just hash -> do
-              when (outputs /= ["out"]) $ lift $ throwError $ ErrorCall $ "Multiple outputs are not supported for fixed-output derivations"
-              hashType <- parseHashType hash
-              return $ Just (hash, hashType)
-
-          return $ Derivation outputs S.empty platform builder args env fixedOutput hashMode useJson
+          return $ Derivation drvName outputs M.empty S.empty platform builder args env mFixedOutput hashMode useJson
       where 
         -- common functions, lifted to WithStringContextT
 
         demand' :: NValue t f m -> (NValue t f m -> WithStringContextT m a) -> WithStringContextT m a
         demand' v f = join $ lift $ demand v (return . f)
 
-        fromValue' :: (FromValue a m (NValue t f m), MonadNix e t f m) => NValue t f m -> WithStringContextT m a
+        -- (FromValue a m (NValue t f m)) would also make sense, but triggers -Wsimplifiable-class-constraints
+        fromValue' :: (FromValue a m (NValue' t f m (NValue t f m)), MonadNix e t f m) => NValue t f m -> WithStringContextT m a
         fromValue' = lift . fromValue
 
-        withFrame' :: forall s e m a . (Framed e m, Exception s) => NixLevel -> s -> WithStringContextT m a -> WithStringContextT m a
+        withFrame' :: (Framed e m, Exception s) => NixLevel -> s -> WithStringContextT m a -> WithStringContextT m a
         withFrame' level f = join . lift . withFrame level f . return
 
-        -- shortcuts to `demand` an attrset field
+        -- shortcuts to `forceValue'` an AttrSet field
 
-        getAttr :: (MonadNix e t f m, FromValue v m (NValue t f m))
-          => Text -> (v -> WithStringContextT m a) -> WithStringContextT m a
-        getAttr n = getAttrOr n (lift $ throwError $ ErrorCall $ "Required attribute '" ++ show n ++ "' not found.")
-
-        getAttrOr :: (MonadNix e t f m, FromValue v m (NValue t f m))
+        getAttrOr :: (MonadNix e t f m, FromValue v m (NValue' t f m (NValue t f m)))
           => Text -> WithStringContextT m a -> (v -> WithStringContextT m a) -> WithStringContextT m a
         getAttrOr n d f = flip (maybe d) (M.lookup n s) $ \v ->  
           withFrame' Info (ErrorCall $ "While evaluating attribute '" ++ show n ++ "'") $ fromValue' v >>= f
 
-        getAttrMaybe :: (MonadNix e t f m, FromValue v m (NValue t f m))
-          => Text -> (v -> WithStringContextT m a) -> WithStringContextT m (Maybe a)
-        getAttrMaybe n f = getAttrOr n (return Nothing) (fmap Just . f)
+        getAttr n = getAttrOr n (lift $ throwError $ ErrorCall $ "Required attribute '" ++ show n ++ "' not found.")
 
         -- Test validity for fields
 
@@ -442,175 +460,7 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
 
         deleteAll :: [Text] -> AttrSet a -> AttrSet a
         deleteAll keys s = foldl' (flip M.delete) s keys
-            
--- --     if (jsonObject) {
--- --         jsonObject.reset();
--- --         drv.env.emplace("__json", jsonBuf.str());
--- --     }
--- -- 
--- --     /* Everything in the context of the strings in the derivation
--- --        attributes should be added as dependencies of the resulting
--- --        derivation. */
--- --     for (auto & path : context) {
--- -- 
--- --         /* Paths marked with `=' denote that the path of a derivation
--- --            is explicitly passed to the builder.  Since that allows the
--- --            builder to gain access to every path in the dependency
--- --            graph of the derivation (including all outputs), all paths
--- --            in the graph must be added to this derivation's list of
--- --            inputs to ensure that they are available when the builder
--- --            runs. */
--- --         if (path.at(0) == '=') {
--- --             /* !!! This doesn't work if readOnlyMode is set. */
--- --             PathSet refs;
--- --             state.store->computeFSClosure(string(path, 1), refs);
--- --             for (auto & j : refs) {
--- --                 drv.inputSrcs.insert(j);
--- --                 if (isDerivation(j))
--- --                     drv.inputDrvs[j] = state.store->queryDerivationOutputNames(j);
--- --             }
--- --         }
--- -- 
--- --         /* Handle derivation outputs of the form ‘!<name>!<path>’. */
--- --         else if (path.at(0) == '!') {
--- --             std::pair<string, string> ctx = decodeContext(path);
--- --             drv.inputDrvs[ctx.first].insert(ctx.second);
--- --         }
--- -- 
--- --         /* Otherwise it's a source file. */
--- --         else
--- --             drv.inputSrcs.insert(path);
--- --     }
--- -- 
--- 
---     -- TODO: handle ignoreNulls
---     (env, context) <- if structuredAttrs
---       then do
---         jsonString <- nvalueToJSONNixString $ deleteAll [ "args" "__ignoreNulls" "__structuredAttrs" ] s
---         let (string, context) = (principledStringIgnoreContext jsonString, principledGetContext jsonString)
---         return (nvSet (S.singleton "__json" string) S.empty, context)
---       else pure (nvSet S.empty S.empty, S.empty) -- TODO
--- 
--- -- 
--- --     if (outputHash) {
--- --         /* Handle fixed-output derivations. */
--- --         if (outputs.size() != 1 || *(outputs.begin()) != "out")
--- --             throw Error(format("multiple outputs are not supported in fixed-output derivations, at %1%") % posDrvName);
--- -- 
--- --         HashType ht = outputHashAlgo.empty() ? htUnknown : parseHashType(outputHashAlgo);
--- --         Hash h(*outputHash, ht);
--- -- 
--- --         Path outPath = state.store->makeFixedOutputPath(outputHashRecursive, h, drvName);
--- --         if (!jsonObject) drv.env["out"] = outPath;
--- --         drv.outputs["out"] = DerivationOutput(outPath,
--- --             (outputHashRecursive ? "r:" : "") + printHashType(h.type),
--- --             h.to_string(Base16, false));
--- --     }
--- -- 
--- --     else {
--- --         /* Construct the "masked" store derivation, which is the final
--- --            one except that in the list of outputs, the output paths
--- --            are empty, and the corresponding environment variables have
--- --            an empty value.  This ensures that changes in the set of
--- --            output names do get reflected in the hash. */
--- --         for (auto & i : outputs) {
--- --             if (!jsonObject) drv.env[i] = "";
--- --             drv.outputs[i] = DerivationOutput("", "", "");
--- --         }
--- -- 
--- --         /* Use the masked derivation expression to compute the output
--- --            path. */
--- --         Hash h = hashDerivationModulo(*state.store, drv);
--- -- 
--- --         for (auto & i : drv.outputs)
--- --             if (i.second.path == "") {
--- --                 Path outPath = state.store->makeOutputPath(i.first, h, drvName);
--- --                 if (!jsonObject) drv.env[i.first] = outPath;
--- --                 i.second.path = outPath;
--- --             }
--- --     }
--- -- 
--- --     /* Write the resulting term into the Nix store directory. */
--- --     Path drvPath = writeDerivation(state.store, drv, drvName, state.repair);
--- -- 
--- --     printMsg(lvlChatty, format("instantiated '%1%' -> '%2%'")
--- --         % drvName % drvPath);
---     path <- {- writeDerivation $ -} case outputHash of
---       Nothing -> error "not implemented" -- Derivation outputs inputSrcs inputDrvs platform builder args env
---       Just hash -> error "not implemented" -- fixedOutputDerivation
--- 
---     let resultAttrs = [ ("drvPath", Direct path) ] ++ map (\o -> (o, Indirect o path))
---     return $ nvSet (M.fromList resultAttrs) M.null
---  where
--- --         auto parseHashMode = [&](const std::string & s) {
--- --             if (s == "recursive") outputHashRecursive = true;
--- --             else if (s == "flat") outputHashRecursive = false;
--- --             else throw EvalError("invalid value '%s' for 'outputHashMode' attribute, at %s", s, posDrvName);
--- --         };
--- 
--- 
--- --         auto handleOutputs = [&](const Strings & ss) {
--- --             outputs.clear();
--- --             for (auto & j : ss) {
--- --                 if (outputs.find(j) != outputs.end())
--- --                     throw EvalError(format("duplicate derivation output '%1%', at %2%") % j % posDrvName);
--- --                 /* !!! Check whether j is a valid attribute
--- --                    name. */
--- --                 /* Derivations cannot be named ‘drv’, because
--- --                    then we'd have an attribute ‘drvPath’ in
--- --                    the resulting set. */
--- --                 if (j == "drv")
--- --                     throw EvalError(format("invalid derivation output name 'drv', at %1%") % posDrvName);
--- --                 outputs.insert(j);
--- --             }
--- --             if (outputs.empty())
--- --                 throw EvalError(format("derivation cannot have an empty set of outputs, at %1%") % posDrvName);
--- --         };
---   getAttr :: forall a e t f m . MonadNix e t f m
---     => Text -> AttrSet (NValue t f m) -> (NValue t f m -> m a) -> m a
---   getAttr n s f = case (M.lookup n s) of
---     Nothing -> throwError $ ErrorCall $ "Required attribute '" ++ n ++ "' not found."
---     Just v -> do
---       withFrame Info ("While evaluating attribute '" ++ name ++ "'") $ do
---         demand v f
--- 
---   getAttrDeeper :: forall a e t f m . MonadNix e t f m
---     => Text -> AttrSet (NValue t f m) -> (NValue t f m -> m a) -> m a
---   getAttrDeeper n s f = case (M.lookup n s) of
---     Nothing -> throwError $ ErrorCall $ "Required attribute '" ++ n ++ "' not found."
---     Just v -> do
---       withFrame Info ("While evaluating attribute '" ++ name ++ "'") $ do
---         demand (Deeper v) f
--- 
---   getAttrOr d n s = case (M.lookup n s) of
---     Nothing -> pure d
---     Just v -> do
---       withFrame Info ("While evaluating attribute '" ++ name ++ "'") $ do
---         demand v fromValue
--- 
---   demandMaybeAttr n s = (demand ?? fromValue) <$> (M.lookup n s)
---   assertNonNull value = do
---     when (null value) $ throwError $ ErrorCall "Expected a non-empty value"
---     return value
---   assertDrvStoreName
---     :: forall e t f m . MonadNix e t f m
---     => Text -> m Text
---   assertDrvStoreName name = do
---     let invalid c = not $ isAscii c && (isAphaNum c || c `elem` "+-._?=") -- isAlphNum allows non-ascii chars.
---     when ("." `isPrefixOf` name)    $ throwError $ ErrorCall "store names cannot start with a period"
---     when (length name > 211)        $ throwError $ ErrorCall "store names must be no longer than 211 characters"
---     when (any invalid name)         $ throwError $ ErrorCall "store name '" ++ name ++ "' contains some invalid character"
---     when (".drv" `isSuffixOf` name) $ throwError $ ErrorCall "Derivation names are not allowed to end in '.drv'"
---     return name
---   
---   coerceNix :: NValue t f m -> m (NValue t f m)
---   coerceNix = toValue <=< coerceToString callFunc CopyToStore CoerceAny
--- 
---   coerceNixList :: NValue t f m -> m (NValue t f m)
---   coerceNixList v = do
---     xs <- fromValue @[NValue t f m] v
---     ys <- traverse (`demand` coerceNix) xs
---     toValue @[NValue t f m] ys
+
 
 defaultTraceEffect :: MonadPutStr m => String -> m ()
 defaultTraceEffect = Nix.Effects.putStrLn
