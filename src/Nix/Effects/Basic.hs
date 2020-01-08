@@ -11,6 +11,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE RecordWildCards #-}
 
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
@@ -29,7 +30,7 @@ import           Data.HashMap.Lazy              ( HashMap )
 import qualified Data.HashMap.Lazy             as M
 import           Data.List
 import           Data.List.Split
-import           Data.Maybe                     ( maybeToList )
+import           Data.Maybe                     ( maybeToList, fromJust )
 import qualified Data.HashSet                  as S
 import           Data.Text                      ( Text )
 import qualified Data.Text                     as Text
@@ -57,6 +58,10 @@ import           Nix.Utils
 import           Nix.Value
 import           Nix.Value.Monad
 import           System.FilePath
+
+import qualified System.Nix.ReadonlyStore    as Store
+import qualified System.Nix.Hash             as Store
+import qualified System.Nix.StorePath        as Store
 
 #ifdef MIN_VERSION_ghc_datasize
 #if MIN_VERSION_ghc_datasize(0,2,0)
@@ -333,7 +338,7 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
     (drv@Derivation {..}, ctx) <- runWithStringContextT' $ buildDerivationWithContext s
     drv' <- case mFixed of
       Just (hash, hashType) -> do
-        outPath <- makeFixedOutputPath (hashMode == Recursive) (Digest @hashType hash) name (toStorePaths ctx)
+        outPath <- makeFixedOutputPath (hashMode == Recursive) (mkDigest hashType hash) name (toStorePaths ctx)
         let env' = M.insert "out" outPath env
         return $ drv { env = env', outputs = M.singleton "out" outPath }
       Nothing -> do
@@ -341,8 +346,9 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
                     { inputs = ctx
                     , env = if useJson then env else foldl' (flip M.insert "") outputNames env
                     })
+        let fakeOuts = map (\o -> makeOutputPath o hash name) outputs
         return $ drv 
-            { env = if useJson then env else M.insertFromList (map (\o -> makeOutputPath o hash name) outputs) env
+            { env = if useJson then env else M.union env fakeOuts
             , inputs = ctx
             , outputs = M.fromList $ map (\o -> makeOutputPath o hash name) outputs
             }
@@ -353,6 +359,12 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
         
   where
     
+    makeOutputPath o h n = Store.makeOutputPath o h (fromJust $ Store.makeStorePathName n)
+    makeFixedOutputPath = Store.makeFixedOutputPath
+    mkDigest = Store.mkDigest
+    toStorePaths ctx =
+    findClosure (StringContext path DirectPath) = 
+
 
     -- | Build a derivation in a context collecting dependencies.
     -- This is complex from a typing standpoint, but it allows to perform the
