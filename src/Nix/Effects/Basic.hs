@@ -270,7 +270,22 @@ defaultDerivationStrict = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
   nn <- maybe (pure False) (demand ?? fromValue) (M.lookup "__ignoreNulls" s)
   s' <- M.fromList <$> mapMaybeM (handleEntry nn) (M.toList s)
   v' <- normalForm =<< toValue @(AttrSet (NValue t f m)) @_ @(NValue t f m) s'
-  nixInstantiateExpr $ "derivationStrict " ++ show (prettyNValue v')
+  let drv = "derivationStrict " ++ show (prettyNValue v')
+      flatDrv = concat . lines $ drv
+
+  defaultTraceEffect $ "\n \n --- \n \n"
+  defaultTraceEffect $ drv
+  -- XXX (srk):
+  -- mkDerivation
+  --  v' -> Derivation{..}
+  --  outputs
+  --  inputDrvs
+  --  inputSrcs
+  --  platform
+  --  builder
+  --  args
+  --  env
+  nixInstantiateExpr flatDrv
  where
   mapMaybeM :: (a -> m (Maybe b)) -> [a] -> m [b]
   mapMaybeM op = foldr f (return [])
