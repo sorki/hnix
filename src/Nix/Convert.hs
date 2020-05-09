@@ -154,7 +154,7 @@ instance ( Convertible e t f m
     NVStr' ns -> pure $ Just ns
     NVPath' p ->
       Just
-        .   hackyMakeNixStringWithoutContext
+        .   (\s -> principledMakeNixStringWithSingletonContext s (StringContext s DirectPath))
         .   Text.pack
         .   unStorePath
         <$> addPath p
