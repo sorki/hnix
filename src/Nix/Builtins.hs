@@ -1094,7 +1094,7 @@ isNull
 isNull = hasKind @()
 
 -- isString cannot use `hasKind` because it coerces derivations to strings.
-isString MonadNix e t f m => NValue t f m -> m (NValue t f m)
+isString :: MonadNix e t f m => NValue t f m -> m (NValue t f m)
 isString v = demand v $ \case
   NVStr{} -> toValue True
   _       -> toValue False
