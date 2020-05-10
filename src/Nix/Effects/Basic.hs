@@ -17,7 +17,14 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 
+
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE NamedFieldPuns #-}
+
 module Nix.Effects.Basic where
+
+
+import Prelude hiding (readFile)
 
 import           Control.Monad.Writer
 import           Control.Arrow
@@ -25,16 +32,23 @@ import           Control.Arrow
 import           Control.Monad
 import           Control.Monad.State.Strict
 import           Data.Char                      ( isAscii, isAlphaNum )
+import           Data.Either                    ( fromRight )
 import           Data.Foldable                  ( foldrM )
 import           Data.HashMap.Lazy              ( HashMap )
 import qualified Data.HashMap.Lazy             as M
+import qualified Data.Map.Strict               as Map
+import           Data.Map.Strict                ( Map )
+import qualified Data.Set                      as Set
+import           Data.Set                       ( Set )
 import           Data.List
-import           Data.List.Split
+import           Data.List.Split                ( splitOn )
 import           Data.Maybe                     ( maybeToList, fromJust )
 import qualified Data.HashSet                  as S
 import           Data.Text                      ( Text )
 import qualified Data.Text                     as Text
+import qualified Data.Text.Encoding            as Text
 import           Data.Text.Prettyprint.Doc
+import           Data.Traversable               ( for )
 import           Nix.Atoms
 import           Nix.Convert
 import           Nix.Effects
@@ -59,9 +73,16 @@ import           Nix.Value
 import           Nix.Value.Monad
 import           System.FilePath
 
-import qualified System.Nix.ReadonlyStore    as Store
-import qualified System.Nix.Hash             as Store
-import qualified System.Nix.StorePath        as Store
+import qualified System.Nix.ReadonlyStore      as Store
+import qualified System.Nix.Hash               as Store
+import qualified System.Nix.StorePath          as Store
+import qualified System.Nix.Store.Remote       as Store
+import qualified System.Nix.Store.Remote.Types as Store
+import qualified System.Nix.StorePath          as Store
+
+import           Text.Megaparsec
+import           Text.Megaparsec.Char
+import qualified Text.Megaparsec.Char.Lexer    as L
 
 #ifdef MIN_VERSION_ghc_datasize
 #if MIN_VERSION_ghc_datasize(0,2,0)
@@ -316,54 +337,212 @@ defaultDerivationStrict = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
 
 data HashType = SHA256 | MD5 | SHA1
 
+instance Show HashType where
+  show SHA256 = "sha256"
+  show MD5 = "md5"
+  show SHA1 = "sha1"
+
 data Derivation = Derivation
   { name :: Text
-  , outputNames :: [ Text ]
-  , outputs :: M.HashMap Text Text
-  , inputs :: S.HashSet StringContext
+  , outputs :: Map Text Text
+  , inputs :: (Set Text, Map Text [Text])
   , platform :: Text
   , builder :: Text -- should be typed as a store path
   , args :: [ Text ]
-  , env :: M.HashMap Text Text
-  , mFixed :: Maybe (Text, HashType)
+  , env :: Map Text Text
+  , mFixed :: Maybe Store.SomeNamedDigest
   , hashMode :: HashMode
   , useJson :: Bool
   }
+  deriving Show
+
+defaultDerivation = Derivation
+  { name        = undefined
+  , outputs     = Map.empty
+  , inputs      = (Set.empty, Map.empty)
+  , platform    = undefined
+  , builder     = undefined
+  , args        = []
+  , env         = Map.empty
+  , mFixed      = Nothing
+  , hashMode    = Flat
+  , useJson     = False
+  }
 
 data HashMode = Flat | Recursive
+  deriving (Show, Eq)
 
 
-defaultDerivationStrict' :: forall e t f m . MonadNix e t f m => NValue t f m -> m Derivation -- m (NValue t f m)
+defaultDerivationStrict' :: forall e t f m . MonadNix e t f m => NValue t f m -> m (NValue t f m)
 defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
-    (drv@Derivation {..}, ctx) <- runWithStringContextT' $ buildDerivationWithContext s
-    drv' <- case mFixed of
-      Just (hash, hashType) -> do
-        outPath <- makeFixedOutputPath (hashMode == Recursive) (mkDigest hashType hash) name (toStorePaths ctx)
-        let env' = M.insert "out" outPath env
-        return $ drv { env = env', outputs = M.singleton "out" outPath }
+    (drv, ctx) <- runWithStringContextT' $ buildDerivationWithContext s
+    name <- makeStorePathName $ name drv
+    let inputs = toStorePaths ctx
+
+    drv' <- case mFixed drv of
+      Just (Store.SomeDigest digest) -> do
+        let out = pathToText $ Store.makeFixedOutputPath "/nix/store" (hashMode drv == Recursive) digest name 
+        let env' = if useJson drv then env drv else Map.insert "out" out (env drv)
+        return $ drv { inputs, env = env', outputs = Map.singleton "out" out }
+
       Nothing -> do
-        hash <- hashDerivationModulo (drv 
-                    { inputs = ctx
-                    , env = if useJson then env else foldl' (flip M.insert "") outputNames env
-                    })
-        let fakeOuts = map (\o -> makeOutputPath o hash name) outputs
+        hash <- hashDerivationModulo $ drv 
+          { inputs
+          , env = if useJson drv then env drv
+                  else foldl' (\m k -> Map.insert k "" m) (env drv) (Map.keys $ outputs drv)
+          }
+        outputs <- sequence $ Map.mapWithKey (\o _ -> makeOutputPath o hash name) (outputs drv)
         return $ drv 
-            { env = if useJson then env else M.union env fakeOuts
-            , inputs = ctx
-            , outputs = M.fromList $ map (\o -> makeOutputPath o hash name) outputs
-            }
+          { inputs
+          , outputs
+          , env = if useJson drv then env drv else Map.union outputs (env drv)
+          }
 
-    drvPath <- writeDerivation drv
+    drvPath <- writeDerivation drv'
 
-    return $ flip nvSet M.empty $ M.insert "drvPath" drvPath (outputs drv')
-        
+    -- Todo: memoize this result here.
+    -- _ <- hashDerivationModulo drv'
+
+    let outputsWithContext = Map.mapWithKey (\out path -> principledMakeNixStringWithSingletonContext path (StringContext (pathToText drvPath) (DerivationOutput out))) (outputs drv')
+    let drvPathWithContext = principledMakeNixStringWithSingletonContext (pathToText drvPath) (StringContext (pathToText drvPath) AllOutputs)
+    -- TODO: Add location information for all the entries.
+    return $ flip nvSet M.empty $ M.fromList $ map (second nvStr) $ ("drvPath", drvPathWithContext): Map.toList outputsWithContext
+
   where
+
+    pathToText = Text.decodeUtf8 . Store.storePathToRawFilePath
     
-    makeOutputPath o h n = Store.makeOutputPath o h (fromJust $ Store.makeStorePathName n)
-    makeFixedOutputPath = Store.makeFixedOutputPath
-    mkDigest = Store.mkDigest
-    toStorePaths ctx =
-    findClosure (StringContext path DirectPath) = 
+    makeStorePathName name = case Store.makeStorePathName name of
+      Left error -> throwError $ ErrorCall $ "Invalid name '" ++ show name ++ "' for use in a store path: " ++ error
+      Right name -> return name
+
+    makeOutputPath o h n = do
+      name <- makeStorePathName (Store.unStorePathName n <> if o == "out" then "" else "-" <> o)
+      return $ pathToText $ Store.makeStorePath "/nix/store" ("output:" <> Text.encodeUtf8 o) h name
+
+    toStorePaths ctx = foldl (flip addToInputs) (Set.empty, Map.empty) ctx
+    addToInputs (StringContext path kind) = case kind of
+      DirectPath -> first (Set.insert path)
+      DerivationOutput o -> second (Map.insertWith (++) path [o])
+      AllOutputs -> 
+        -- TODO: recursive lookup. See prim_derivationStrict
+        -- XXX: When is this really used ?
+        undefined
+
+    writeDerivation (drv@Derivation {inputs, name}) = do
+      let (inputSrcs, inputDrvs) = inputs
+      references <- Set.fromList <$> (mapM parsePath $ Set.toList $ inputSrcs `Set.union` (Set.fromList $ Map.keys inputDrvs))
+      path <- addTextToStore (Text.append name ".drv") (unparseDrv drv) (S.fromList $ Set.toList references) False
+      parsePath $ Text.pack $ unStorePath path
+
+    -- recurse the graph of inputDrvs to replace fixed output derivations with their fixed output hash
+    -- this avoids propagating changes to their .drv when the output hash stays the same.
+    hashDerivationModulo :: Derivation -> m (Store.Digest 'Store.SHA256)
+    hashDerivationModulo drv@(Derivation {mFixed = Just (Store.SomeDigest (digest :: Store.Digest ht)), outputs, hashMode}) =
+      case Map.toList outputs of
+        [("out", path)] -> return $ Store.hash @'Store.SHA256 $ Text.encodeUtf8 $
+          "fixed:out:" <> (if hashMode == Recursive then "r:" else "") <> (Store.algoName @ht) <> ":" <> (Store.encodeBase16 digest) <> ":" <> path
+        outputsList -> throwError $ ErrorCall $ "This is weird. A fixed output drv should only have one outptu named 'out'. Got " ++ show outputsList 
+    hashDerivationModulo drv@(Derivation {inputs = (inputSrcs, inputDrvs)}) = do
+      inputsModulo <- Map.fromList <$> forM (Map.toList inputDrvs) (\(path, outs) -> do
+        drv2 <- readDerivation $ Text.unpack path
+        hash <- Store.encodeBase16 <$> hashDerivationModulo drv2
+        return (hash, outs)
+        )
+      return $ Store.hash @'Store.SHA256 $ Text.encodeUtf8 $ unparseDrv (drv {inputs = (inputSrcs, inputsModulo)})
+
+    unparseDrv :: Derivation -> Text
+    unparseDrv (Derivation {..}) = Text.append "Derive" $ parens 
+        [ -- outputs: [("out", "/nix/store/.....-out", "", ""), ...]
+          list $ flip map (Map.toList outputs) (\(name, path) -> 
+            let prefix = if hashMode == Recursive then "r:" else "" in
+            case mFixed of
+              Nothing -> parens [s name, s path, s "", s ""]
+              Just (Store.SomeDigest (digest :: Store.Digest ht)) ->
+                parens [s name, s path, s $ prefix <> Store.algoName @ht, s $ Store.encodeBase16 digest]
+            )
+        , -- inputDrvs
+          list $ flip map (Map.toList $ snd inputs) (\(path, outs) ->
+            parens [s path, list $ map s $ sort outs])
+        , -- inputSrcs
+          list (map s $ Set.toList $ fst inputs)
+        , s platform
+        , s builder
+        , -- run script args
+          list $ map s args
+        , -- env (key value pairs)
+          list $ flip map (Map.toList env) (\(k, v) ->
+            parens [s k, s v])
+        ]
+      where
+        parens :: [Text] -> Text
+        parens ts = Text.concat ["(", Text.intercalate "," ts, ")"]
+        list   :: [Text] -> Text
+        list   ls = Text.concat ["[", Text.intercalate "," ls, "]"]
+        s = Text.pack . show
+
+    readDerivation :: String -> m Derivation
+    readDerivation path = do
+      content <- Text.decodeUtf8 <$> readFile path
+      case parse derivationParser path content of
+        Left error -> throwError $ ErrorCall $ "Failed to parse " ++ show path ++ ":\n" ++ show error
+        Right drv -> return drv
+
+    derivationParser :: Parser Derivation
+    derivationParser = do
+      _ <- string "Derive("
+      -- outputs: [("out", "/nix/store/.....-out", "", ""), ...]
+      fullOutputs <- list $
+        fmap (\[n, p, ht, h] -> (n, p, ht, h)) $ parens s
+      _ <- string ","
+      inputDrvs <- fmap Map.fromList $ list $
+        fmap (,) (string "(" *> s <* string ",") <*> (list s <* string ")")
+      _ <- string ","
+      inputSrcs <- fmap Set.fromList $ list s <* string ","
+      platform  <- s                          <* string ","
+      builder   <- s                          <* string ","
+      args      <- list s                     <* string ","
+      env <- fmap Map.fromList $ list $ fmap (\[a, b] -> (a, b)) $ parens s 
+      _ <- string ")" <* eof
+
+      let outputs = Map.fromList $ map (\(a, b, _, _) -> (a, b)) fullOutputs
+      let (mFixed, hashMode) = parseFixed fullOutputs
+      let name = "" -- FIXME (extract from file path ?)
+      let useJson = ["__json"] == Map.keys env
+
+      return $ Derivation {inputs = (inputSrcs, inputDrvs), ..}
+     where
+      s :: Parser Text
+      s = fmap Text.pack $ string "\"" *> manyTill (escaped <|> regular) (string "\"")
+      escaped = char '\\' *>
+        (   '\n' <$ string "n"
+        <|> '\r' <$ string "r"
+        <|> '\t' <$ string "t"
+        <|> anySingle
+        )
+      regular = noneOf ['\\', '"']
+
+      parens :: Parser a -> Parser [a]
+      parens p = (string "(") *> sepBy p (string ",") <* (string ")")
+      list   p = (string "[") *> sepBy p (string ",") <* (string "]")
+
+      parseFixed :: [(Text, Text, Text, Text)] -> (Maybe Store.SomeNamedDigest, HashMode)
+      parseFixed fullOutputs = case fullOutputs of
+        [("out", p, ht, h)] | ht /= "" && h /= "" ->
+          let (ht, hashMode) = case Text.splitOn ":" ht of
+                ["r", ht] -> (ht, Recursive)
+                [ht] ->      (ht, Flat)
+                _ -> undefined -- What ?! -- TODO: Throw a proper error
+          in case Store.mkNamedDigest ht h of
+            Right digest -> (Just digest, hashMode)
+            Left error -> undefined -- TODO: Raise a proper parse error.
+        _ -> (Nothing, Flat)
+
+
+    parsePath p = case Store.parsePath "/nix/store" (Text.encodeUtf8 p) of
+      Left err -> throwError $ ErrorCall $ "Cannot parse store path " ++ show p ++ ":\n" ++ show err
+      Right path -> return path
+
 
 
     -- | Build a derivation in a context collecting dependencies.
@@ -378,9 +557,9 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
           useJson     <- getAttrOr    "__structuredAttrs" (return False)   $ return
           ignoreNulls <- getAttrOr    "__ignoreNulls"     (return False)   $ return
 
-          args        <- getAttr      "args"              $ mapM (fromValue' >=> extractNixString)
-          builder     <- getAttr      "builder"           $ extractNixString
-          platform    <- getAttr      "system"            $ extractNoCtx >=> assertNonNull
+          args        <- getAttrOr    "args"              (return [])      $ mapM (fromValue' >=> extractNixString)
+          builder     <- getAttr      "builder"                            $ extractNixString
+          platform    <- getAttr      "system"                             $ extractNoCtx >=> assertNonNull
           mHash       <- getAttrOr    "outputHash"        (return Nothing) $ extractNoCtx >=> (return . Just)
           hashMode    <- getAttrOr    "outputHashMode"    (return Flat)    $ extractNoCtx >=> parseHashMode
           outputs     <- getAttrOr    "outputs"           (return ["out"]) $ mapM (fromValue' >=> extractNoCtx)
@@ -389,8 +568,9 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
             Nothing -> return Nothing
             Just hash -> do
               when (outputs /= ["out"]) $ lift $ throwError $ ErrorCall $ "Multiple outputs are not supported for fixed-output derivations"
-              hashType <- getAttr "outputHashAlgo" $ extractNoCtx >=> parseHashType
-              return $ Just (hash, hashType)
+              hashType <- getAttr "outputHashAlgo" $ extractNoCtx
+              digest <- lift $ either (throwError . ErrorCall) return $ Store.mkNamedDigest hashType hash
+              return $ Just digest
 
           -- filter out null values if needed.
           attrs <- if not ignoreNulls
@@ -405,12 +585,16 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
               jsonString :: NixString <- lift $ nvalueToJSONNixString $ flip nvSet M.empty $ 
                 deleteAll [ "args", "__ignoreNulls", "__structuredAttrs" ] attrs
               string :: Text <- extractNixString jsonString
-              return $ M.singleton "__json" string
+              return $ Map.singleton "__json" string
             else
               mapM (lift . coerceToString callFunc CopyToStore CoerceAny >=> extractNixString) $
-                deleteAll [ "args", "__ignoreNulls" ] attrs
+                Map.fromList $ M.toList $ deleteAll [ "args", "__ignoreNulls" ] attrs
 
-          return $ Derivation drvName outputs M.empty S.empty platform builder args env mFixedOutput hashMode useJson
+          return $ defaultDerivation { platform, builder, args, env,  hashMode, useJson
+            , name = drvName
+            , outputs = Map.fromList $ map (\o -> (o, "")) outputs
+            , mFixed = mFixedOutput
+            }
       where 
         -- common functions, lifted to WithStringContextT
 
@@ -460,13 +644,6 @@ defaultDerivationStrict' = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
           "flat" ->      return Flat
           "recursive" -> return Recursive
           other -> lift $ throwError $ ErrorCall $ "Hash mode " ++ show other ++ " is not valid. It must be either 'flat' or 'recursive'"
-
-        parseHashType :: Text -> WithStringContextT m HashType
-        parseHashType = \case
-          "sha1"   -> return SHA1
-          "sha256" -> return SHA256
-          "md5"    -> return MD5
-          other -> lift $ throwError $ ErrorCall $ "Hash type " ++ show other ++ " is not a valid hash type"
 
         -- Other helpers
 
