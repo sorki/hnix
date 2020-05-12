@@ -35,6 +35,7 @@ import           Nix.Cited.Basic
 import           Nix.Context
 import           Nix.Effects
 import           Nix.Effects.Basic
+import           Nix.Effects.Derivation
 import           Nix.Expr.Types.Annotated
 import           Nix.Fresh
 import           Nix.Fresh.Basic
@@ -166,7 +167,7 @@ instance ( MonadFix m
   findPath         = defaultFindPath
   importPath       = defaultImportPath
   pathToDefaultNix = defaultPathToDefaultNix
-  derivationStrict = defaultDerivationStrict'
+  derivationStrict = defaultDerivationStrict
   traceEffect      = defaultTraceEffect
 
 instance ( MonadAtomicRef m

@@ -807,6 +807,7 @@ library
       Nix.Convert
       Nix.Effects
       Nix.Effects.Basic
+      Nix.Effects.Derivation
       Nix.Eval
       Nix.Exec
       Nix.Expr
