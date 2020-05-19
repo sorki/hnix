@@ -209,7 +209,6 @@ instance MonadHttp IO where
         $  "success in downloading but hnix-store is not yet ready; url = "
         ++ urlstr
 
-
 class Monad m => MonadPutStr m where
     --TODO: Should this be used *only* when the Nix to be evaluated invokes a
     --`trace` operation?

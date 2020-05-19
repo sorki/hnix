@@ -25,6 +25,7 @@ module Nix
   , nixTracingEvalExprLoc
   , evaluateExpression
   , processResult
+  , processQuery
   )
 where
 
@@ -53,6 +54,10 @@ import           Nix.Utils
 import           Nix.Value
 import           Nix.Value.Monad
 import           Nix.XML
+
+import           Text.Read
+import           Text.Regex.TDFA
+import           Data.Maybe
 
 -- | This is the entry point for all evaluations, whatever the expression tree
 --   type. It sets up the common Nix environment and applies the
@@ -163,3 +168,72 @@ processResult h val = do
         ++ Text.unpack k
         ++ "', but got: "
         ++ show v
+
+processQuery
+  :: forall e t f m a
+   . (MonadNix e t f m, Has e Options)
+  => (NValue t f m -> m a)
+  -> Text.Text
+  -> NValue t f m
+  -> m a
+processQuery h query val = do
+  opts :: Options <- asks (view hasLens)
+  case attr opts of
+    Nothing                         -> h val
+    Just (Text.splitOn "." -> keys) -> go keys val
+ where
+  re x | x == Text.empty = False
+  re x | Text.head x == '(' && Text.last x == ')' = True
+  re x | otherwise = False
+
+  re' x = case re x of
+    True -> Right $ mkRe $ Text.init $ Text.drop 1 x
+    False -> Left "nop"
+
+  mkRe p = makeRegex (p) :: Regex
+  go :: [Text.Text] -> NValue t f m -> m a
+  go [] v = h v
+  -- re
+  go ((re' -> Right cre) : ks) v = demand v $ \case
+    NVSet xs l -> case ks of
+      [] -> h (nvSet (M.filterWithKey (\k _ -> (isJust $ matchOnceText cre k)) xs) l)
+      --[] -> h (nvSet (M.filterWithKey (\k _ -> (Text.isPrefixOf "zz" k)) xs) l)
+      _ -> go ks (nvSet (M.filterWithKey (\k _ -> (k=="zzuf")) xs) l)
+    _ ->
+      errorWithoutStackTrace
+        $  "Expected a set for re '"
+        ++ show ".."
+        ++ "', but got: "
+        ++ show v
+
+      --case M.filter "zzuf" xs of
+  -- number
+  go ((Text.decimal -> Right (n,"")) : ks) v = demand v $ \case
+    NVList xs -> case ks of
+      [] -> h (xs !! n)
+      _  -> go ks (xs !! n)
+    _ ->
+      errorWithoutStackTrace
+        $  "Expected a list for selector '"
+        ++ show n
+        ++ "', but got: "
+        ++ show v
+  -- key string
+  go (k : ks) v = demand v $ \case
+    NVSet xs _ -> case M.lookup k xs of
+      Nothing ->
+        errorWithoutStackTrace
+          $  "Set does not contain key '"
+          ++ Text.unpack k
+          ++ "'"
+          ++ show xs
+      Just v' -> case ks of
+        [] -> h v'
+        _  -> go ks v'
+    _ ->
+      errorWithoutStackTrace
+        $  "Expected a set for selector '"
+        ++ Text.unpack k
+        ++ "', but got: "
+        ++ show v
+

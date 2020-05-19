@@ -115,7 +115,8 @@ main = do
     , not (null (arg opts) && null (argstr opts))
     = evaluateExpression mpath Nix.nixEvalExprLoc printer expr
     | evaluate opts
-    = processResult printer =<< Nix.nixEvalExprLoc mpath expr
+     = processQuery printer "blah" =<< Nix.nixEvalExprLoc mpath expr
+    -- = processResult printer =<< Nix.nixEvalExprLoc mpath expr
     | xml opts
     = error "Rendering expression trees to XML is not yet implemented"
     | json opts
