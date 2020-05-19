@@ -7,8 +7,12 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Nix.Effects where
+
+import           Debug.Trace                    ( traceShowId )
 
 import           Prelude                 hiding ( putStr
                                                 , putStrLn
@@ -17,13 +21,18 @@ import           Prelude                 hiding ( putStr
 import qualified Prelude
 
 import           Control.Monad.Trans
+import qualified Data.ByteString               as BS
+import qualified Data.HashSet                  as HS
+import           Data.Proxy                     ( Proxy(..) )
 import           Data.Text                      ( Text )
 import qualified Data.Text                     as T
-import           Network.HTTP.Client     hiding ( path )
+import qualified Data.Text.Encoding            as T
+import qualified Data.Text.Lazy                as TL
+import           Network.HTTP.Client     hiding ( path, Proxy )
 import           Network.HTTP.Client.TLS
 import           Network.HTTP.Types
 import           Nix.Expr
-import           Nix.Frames
+import           Nix.Frames              hiding ( Proxy )
 import           Nix.Parser
 import           Nix.Render
 import           Nix.Utils
@@ -32,8 +41,15 @@ import qualified Paths_hnix
 import qualified System.Directory              as S
 import           System.Environment
 import           System.Exit
+import           System.FilePath                ( takeFileName )
 import qualified System.Info
 import           System.Process
+
+import qualified System.Nix.ReadonlyStore      as Store
+import qualified System.Nix.Hash               as Store
+import qualified System.Nix.Store.Remote       as Store
+import qualified System.Nix.Store.Remote.Types as Store
+import qualified System.Nix.StorePath          as Store
 
 -- | A path into the nix store
 newtype StorePath = StorePath { unStorePath :: FilePath }
@@ -127,7 +143,7 @@ instance MonadInstantiate IO where
                                                     ["--eval", "--expr", expr]
                                                     ""
     case exitCode of
-      ExitSuccess -> case parseNixTextLoc (T.pack out) of
+      ExitSuccess -> case parseNixTextLoc (T.pack $ traceShowId out) of
         Failure e ->
           return
             $  Left
@@ -226,36 +242,58 @@ print = putStrLn . show
 instance MonadPutStr IO where
   putStr = Prelude.putStr
 
-class Monad m => MonadStore m where
-    -- | Import a path into the nix store, and return the resulting path
-    addPath' :: FilePath -> m (Either ErrorCall StorePath)
 
-    -- | Add a file with the given name and contents to the nix store
-    toFile_' :: FilePath -> String -> m (Either ErrorCall StorePath)
+type RecursiveFlag = Bool
+type RepairFlag = Bool
+type StorePathName = Text
+type FilePathFilter m = FilePath -> m Bool
+type StorePathSet = HS.HashSet StorePath
+
+class Monad m => MonadStore m where
+
+    -- | Add a path to the store, with bells and whistles
+    addToStore :: StorePathName -> FilePath -> RecursiveFlag -> RepairFlag -> m (Either ErrorCall StorePath)
+    default addToStore :: (MonadTrans t, MonadStore m', m ~ t m') => StorePathName -> FilePath -> RecursiveFlag -> RepairFlag -> m (Either ErrorCall StorePath)
+    addToStore a b c d = lift $ addToStore a b c d
+
+    -- | Add a nar (action) to the store
+    -- addToStore' :: StorePathName -> IO Nar -> RecursiveFlag -> RepairFlag -> m (Either ErrorCall StorePath)
+
+    addTextToStore' :: StorePathName -> Text -> Store.StorePathSet -> RepairFlag -> m (Either ErrorCall StorePath)
+    default addTextToStore' :: (MonadTrans t, MonadStore m', m ~ t m') => StorePathName -> Text -> Store.StorePathSet -> RepairFlag -> m (Either ErrorCall StorePath)
+    addTextToStore' a b c d = lift $ addTextToStore' a b c d
+
+parseStoreResult :: Monad m => String -> (Either String a, [Store.Logger]) -> m (Either ErrorCall a)
+parseStoreResult name res = case res of 
+  (Left msg, log) -> return $ Left $ ErrorCall $ "Failed to execute '" ++ name ++ "': " ++ msg ++ "\n" ++ show log
+  (Right result, _) -> return $ Right result
 
 instance MonadStore IO where
-  addPath' path = do
-    (exitCode, out, _) <- readProcessWithExitCode "nix-store" ["--add", path] ""
-    case exitCode of
-      ExitSuccess -> do
-        let dropTrailingLinefeed p = take (length p - 1) p
-        return $ Right $ StorePath $ dropTrailingLinefeed out
-      _ ->
-        return
-          $  Left
-          $  ErrorCall
-          $  "addPath: failed: nix-store --add "
-          ++ show path
 
---TODO: Use a temp directory so we don't overwrite anything important
-  toFile_' filepath content = do
-    writeFile filepath content
-    storepath <- addPath' filepath
-    S.removeFile filepath
-    return storepath
+  addToStore name path recursive repair = case Store.makeStorePathName name of
+    Left error -> return $ Left $ ErrorCall $ "String '" ++ show name ++ "' is not a valid path name: " ++ error
+    Right pathName -> do
+      -- todo: pass the hash explicitly
+      -- TODO: Handle the filter
+      res <- Store.runStore $ Store.addToStore pathName path recursive (Proxy :: Proxy Store.SHA256) (const False) repair
+      path <- parseStoreResult "addToStore" res
+      case path of
+        Left error -> return $ Left error
+        Right path -> return $ Right $ StorePath $ T.unpack $ T.decodeUtf8 $ Store.storePathToRawFilePath path
+
+  addTextToStore' name text references repair = do
+    -- TODO: Handle references
+    res <- Store.runStore $ Store.addTextToStore name text references repair
+    path <- parseStoreResult "addTextToStore" res
+    case path of
+      Left error -> return $ Left error
+      Right path -> return $ Right $ StorePath $ T.unpack $ T.decodeUtf8 $ Store.storePathToRawFilePath path
+
+addTextToStore :: (Framed e m, MonadStore m) => StorePathName -> Text -> Store.StorePathSet -> RepairFlag -> m StorePath
+addTextToStore a b c d = either throwError return =<< addTextToStore' a b c d
 
 addPath :: (Framed e m, MonadStore m) => FilePath -> m StorePath
-addPath p = either throwError return =<< addPath' p
+addPath p = either throwError return =<< addToStore (T.pack $ takeFileName p) p True False
 
 toFile_ :: (Framed e m, MonadStore m) => FilePath -> String -> m StorePath
-toFile_ p contents = either throwError return =<< toFile_' p contents
+toFile_ p contents = addTextToStore (T.pack p) (T.pack contents) HS.empty False

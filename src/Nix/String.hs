@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# OPTIONS_GHC -Wno-unused-top-binds #-}
 module Nix.String
   ( NixString
@@ -28,11 +29,14 @@ module Nix.String
   , principledStringMConcat
   , WithStringContext
   , WithStringContextT(..)
+  , withStringContextT
   , extractNixString
   , addStringContext
   , addSingletonStringContext
   , runWithStringContextT
+  , runWithStringContextT'
   , runWithStringContext
+  , runWithStringContext'
   )
 where
 
@@ -213,6 +217,15 @@ newtype WithStringContextT m a = WithStringContextT (WriterT (S.HashSet StringCo
 
 type WithStringContext = WithStringContextT Identity
 
+type MonadWithStringContext = MonadWriter (S.HashSet StringContext)
+
+
+-- | Construct a withStringContext computation from a (result, stringContext) computation.
+-- (The inverse of "runWithStringContextT'".)
+withStringContextT :: (Functor m) => m (a, S.HashSet StringContext) -> WithStringContextT m a
+withStringContextT f = WithStringContextT $ WriterT f
+    -- (\(a, w') -> let wt = (S.union w w') in wt `seq` (a, wt)) <$> f
+
 -- | Add 'StringContext's into the resulting set.
 addStringContext
   :: Monad m => S.HashSet StringContext -> WithStringContextT m ()
@@ -231,6 +244,14 @@ runWithStringContextT :: Monad m => WithStringContextT m Text -> m NixString
 runWithStringContextT (WithStringContextT m) =
   uncurry NixString <$> runWriterT m
 
+-- | Run an action while collecting used contexts
+runWithStringContextT' :: Monad m => WithStringContextT m a -> m (a, S.HashSet StringContext)
+runWithStringContextT' (WithStringContextT m) = runWriterT m
+
 -- | Run an action producing a string with a context and put those into a 'NixString'.
 runWithStringContext :: WithStringContextT Identity Text -> NixString
 runWithStringContext = runIdentity . runWithStringContextT
+
+-- | Run an action producing a string with a context and put those into a 'NixString'.
+runWithStringContext' :: WithStringContextT Identity a -> (a, S.HashSet StringContext)
+runWithStringContext' = runIdentity . runWithStringContextT'

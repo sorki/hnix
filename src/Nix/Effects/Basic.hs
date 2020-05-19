@@ -1,46 +1,39 @@
 {-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE ViewPatterns #-}
-
-{-# OPTIONS_GHC -Wno-missing-signatures #-}
-{-# OPTIONS_GHC -Wno-orphans #-}
-{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 
 module Nix.Effects.Basic where
 
-import           Control.Monad
-import           Control.Monad.State.Strict
+
+import           Control.Monad                  ( (>=>), foldM )
+
+import           Control.Monad.State.Strict     ( MonadState, get, modify )
 import           Data.HashMap.Lazy              ( HashMap )
 import qualified Data.HashMap.Lazy             as M
-import           Data.List
-import           Data.List.Split
-import           Data.Maybe                     ( maybeToList )
+import           Data.List                      ( inits, tails, isPrefixOf, intercalate )
+import           Data.List.Split                ( splitOn )
 import           Data.Text                      ( Text )
 import qualified Data.Text                     as Text
 import           Data.Text.Prettyprint.Doc
-import           Nix.Atoms
 import           Nix.Convert
 import           Nix.Effects
-import           Nix.Exec                       ( MonadNix
-                                                , callFunc
-                                                , evalExprLoc
-                                                , nixInstantiateExpr
-                                                )
+import           Nix.Exec                       ( MonadNix , evalExprLoc , nixInstantiateExpr)
 import           Nix.Expr
 import           Nix.Frames
-import           Nix.Normal
 import           Nix.Parser
-import           Nix.Pretty
 import           Nix.Render
 import           Nix.Scope
 import           Nix.String
-import           Nix.String.Coerce
 import           Nix.Utils
 import           Nix.Value
 import           Nix.Value.Monad
@@ -64,13 +57,13 @@ defaultMakeAbsolutePath origPath = do
           Nothing -> getCurrentDirectory
           Just v  -> demand v $ \case
             NVPath s -> return $ takeDirectory s
-            v ->
+            val ->
               throwError
                 $  ErrorCall
                 $  "when resolving relative path,"
                 ++ " __cur_file is in scope,"
                 ++ " but is not a path; it is: "
-                ++ show v
+                ++ show val
       pure $ cwd <///> origPathExpanded
   removeDotDotIndirections <$> canonicalizePath absPath
 
@@ -111,13 +104,13 @@ findEnvPathM name = do
  where
   nixFilePath :: MonadEffects t f m => FilePath -> m (Maybe FilePath)
   nixFilePath path = do
-    path   <- makeAbsolutePath @t @f path
-    exists <- doesDirectoryExist path
+    apath  <- makeAbsolutePath @t @f path
+    exists <- doesDirectoryExist apath
     path'  <- if exists
-      then makeAbsolutePath @t @f $ path </> "default.nix"
-      else return path
-    exists <- doesFileExist path'
-    return $ if exists then Just path' else Nothing
+      then makeAbsolutePath @t @f $ apath </> "default.nix"
+      else return apath
+    exists' <- doesFileExist path'
+    return $ if exists' then Just path' else Nothing
 
 findPathBy
   :: forall e t f m
@@ -126,8 +119,8 @@ findPathBy
   -> [NValue t f m]
   -> FilePath
   -> m FilePath
-findPathBy finder l name = do
-  mpath <- foldM go Nothing l
+findPathBy finder ls name = do
+  mpath <- foldM go Nothing ls
   case mpath of
     Nothing ->
       throwError
@@ -226,13 +219,13 @@ findPathM
   => [NValue t f m]
   -> FilePath
   -> m FilePath
-findPathM = findPathBy path
+findPathM = findPathBy toExistingPath
  where
-  path :: MonadEffects t f m => FilePath -> m (Maybe FilePath)
-  path path = do
-    path   <- makeAbsolutePath @t @f path
-    exists <- doesPathExist path
-    return $ if exists then Just path else Nothing
+  toExistingPath :: MonadEffects t f m => FilePath -> m (Maybe FilePath)
+  toExistingPath path = do
+    apath  <- makeAbsolutePath @t @f path
+    exists <- doesPathExist apath
+    return $ if exists then Just apath else Nothing
 
 defaultImportPath
   :: (MonadNix e t f m, MonadState (HashMap FilePath NExprLoc) m)
@@ -263,54 +256,6 @@ pathToDefaultNixFile :: MonadFile m => FilePath -> m FilePath
 pathToDefaultNixFile p = do
   isDir <- doesDirectoryExist p
   pure $ if isDir then p </> "default.nix" else p
-
-defaultDerivationStrict
-  :: forall e t f m . MonadNix e t f m => NValue t f m -> m (NValue t f m)
-defaultDerivationStrict = fromValue @(AttrSet (NValue t f m)) >=> \s -> do
-  nn <- maybe (pure False) (demand ?? fromValue) (M.lookup "__ignoreNulls" s)
-  s' <- M.fromList <$> mapMaybeM (handleEntry nn) (M.toList s)
-  v' <- normalForm =<< toValue @(AttrSet (NValue t f m)) @_ @(NValue t f m) s'
-  let drv = "derivationStrict " ++ show (prettyNValue v')
-      flatDrv = concat . lines $ drv
-
-  defaultTraceEffect $ "\n \n --- \n \n"
-  defaultTraceEffect $ drv
-  -- XXX (srk):
-  -- mkDerivation
-  --  v' -> Derivation{..}
-  --  outputs
-  --  inputDrvs
-  --  inputSrcs
-  --  platform
-  --  builder
-  --  args
-  --  env
-  nixInstantiateExpr flatDrv
- where
-  mapMaybeM :: (a -> m (Maybe b)) -> [a] -> m [b]
-  mapMaybeM op = foldr f (return [])
-    where f x xs = op x >>= (<$> xs) . (++) . maybeToList
-
-  handleEntry :: Bool -> (Text, NValue t f m) -> m (Maybe (Text, NValue t f m))
-  handleEntry ignoreNulls (k, v) = fmap (k, ) <$> case k of
-      -- The `args' attribute is special: it supplies the command-line
-      -- arguments to the builder.
-      -- TODO This use of coerceToString is probably not right and may
-      -- not have the right arguments.
-    "args"          -> demand v $ fmap Just . coerceNixList
-    "__ignoreNulls" -> pure Nothing
-    _               -> demand v $ \case
-      NVConstant NNull | ignoreNulls -> pure Nothing
-      v'                             -> Just <$> coerceNix v'
-   where
-    coerceNix :: NValue t f m -> m (NValue t f m)
-    coerceNix = toValue <=< coerceToString callFunc CopyToStore CoerceAny
-
-    coerceNixList :: NValue t f m -> m (NValue t f m)
-    coerceNixList v = do
-      xs <- fromValue @[NValue t f m] v
-      ys <- traverse (`demand` coerceNix) xs
-      toValue @[NValue t f m] ys
 
 defaultTraceEffect :: MonadPutStr m => String -> m ()
 defaultTraceEffect = Nix.Effects.putStrLn
