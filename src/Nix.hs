@@ -123,6 +123,11 @@ evaluateExpression mpath evaluator handler expr = do
 
   argmap args = nvSet (M.fromList args) mempty
 
+-- | Process the evaluation result with function `h`.
+--
+-- If `Options.attr` is not `Nothing` follow the desired
+-- attribute path and apply `h` only to the selected value,
+-- apply `h` to the full result otherwise.
 processResult
   :: forall e t f m a
    . (MonadNix e t f m, Has e Options)

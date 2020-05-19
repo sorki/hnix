@@ -20,7 +20,7 @@ data Options = Options
     , evaluate     :: Bool
     , json         :: Bool
     , xml          :: Bool
-    , attr         :: Maybe Text
+    , attr         :: Maybe Text -- ^ Attribute selector path e.g. "a.b.c.0"
     , include      :: [FilePath]
     , check        :: Bool
     , readFrom     :: Maybe FilePath
