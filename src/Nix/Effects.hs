@@ -275,7 +275,7 @@ instance MonadStore IO where
     Right pathName -> do
       -- todo: pass the hash explicitly
       -- TODO: Handle the filter
-      res <- Store.runStore $ Store.addToStore pathName path recursive (Proxy :: Proxy Store.SHA256) (const False) repair
+      res <- Store.runStore $ Store.addToStore @'Store.SHA256 pathName path recursive  (const False) repair
       path <- parseStoreResult "addToStore" res
       case path of
         Left error -> return $ Left error
