@@ -1,5 +1,10 @@
 # Changelog
 
+## [unreleased](https://github.com/haskell-nix/hnix/compare/0.9.1...master) (2020-MM-DD)
+
+* Previous release was `0.9.1`. In new release:
+* Not much yet
+
 ## [0.9.1](https://github.com/haskell-nix/hnix/compare/0.9.0...0.9.1) (2020-07-13)
 
 * Previous release was `0.9.0`. In new release:
